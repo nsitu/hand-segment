@@ -1,0 +1,580 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>MediaPipe Hand + OpenCV GrabCut Mask Refinement</title>
+  <link rel="icon" href="data:," />
+  <style>
+    :root {
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: #f5f5f5;
+      background: #111;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      background: radial-gradient(circle at top, #2a2a2a, #111 60%);
+    }
+
+    main {
+      width: min(960px, calc(100vw - 32px));
+      display: grid;
+      gap: 16px;
+    }
+
+    header {
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      align-items: end;
+      flex-wrap: wrap;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: clamp(1.25rem, 3vw, 2rem);
+    }
+
+    p {
+      margin: 0.35rem 0 0;
+      color: #cfcfcf;
+      max-width: 72ch;
+      line-height: 1.45;
+    }
+
+    .stage {
+      position: relative;
+      width: 100%;
+      aspect-ratio: 16 / 9;
+      overflow: hidden;
+      border-radius: 20px;
+      background: #000;
+      box-shadow: 0 20px 60px rgba(0,0,0,0.4);
+    }
+
+    video, canvas {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      transform: scaleX(-1);
+    }
+
+    #overlayCanvas {
+      pointer-events: none;
+    }
+
+    .controls {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 12px 16px;
+      padding: 14px;
+      border: 1px solid rgba(255,255,255,0.12);
+      border-radius: 16px;
+      background: rgba(255,255,255,0.06);
+    }
+
+    label {
+      display: inline-flex;
+      gap: 8px;
+      align-items: center;
+      color: #ddd;
+      font-size: 0.95rem;
+    }
+
+    input[type="range"] {
+      width: 130px;
+    }
+
+    button {
+      border: 0;
+      border-radius: 999px;
+      padding: 10px 16px;
+      font-weight: 700;
+      color: #111;
+      background: #fff;
+      cursor: pointer;
+    }
+
+    button:disabled {
+      opacity: 0.5;
+      cursor: wait;
+    }
+
+    #status {
+      margin-left: auto;
+      color: #f0d58c;
+      font-size: 0.9rem;
+    }
+
+    .debug {
+      color: #aaa;
+      font-size: 0.85rem;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <div>
+        <h1>Hand mask refinement with MediaPipe + GrabCut</h1>
+        <p>
+          MediaPipe gives a rough hand prior from landmarks. OpenCV GrabCut refines that prior into a mask.
+          The result is drawn as a semi-transparent red overlay on the webcam feed.
+        </p>
+      </div>
+    </header>
+
+    <section class="stage">
+      <video id="video" autoplay playsinline muted></video>
+      <canvas id="overlayCanvas"></canvas>
+    </section>
+
+    <section class="controls">
+      <button id="startButton" disabled>Loading…</button>
+
+      <label>
+        Process scale
+        <input id="scaleInput" type="range" min="0.25" max="1" step="0.05" value="0.5" />
+        <span id="scaleValue">0.50</span>
+      </label>
+
+      <label>
+        Padding
+        <input id="paddingInput" type="range" min="10" max="120" step="5" value="50" />
+        <span id="paddingValue">50</span>
+      </label>
+
+      <label>
+        Iterations
+        <input id="iterationsInput" type="range" min="1" max="5" step="1" value="1" />
+        <span id="iterationsValue">1</span>
+      </label>
+
+      <label>
+        <input id="showLandmarksInput" type="checkbox" checked />
+        show landmarks
+      </label>
+
+      <span id="status">Loading libraries…</span>
+    </section>
+
+    <p class="debug">
+      Tip: GrabCut is colour-sensitive. It works best with a hand against a visually different background and may struggle with skin-coloured objects, motion blur, or very small hands.
+    </p>
+  </main>
+
+  <canvas id="frameCanvas" hidden></canvas>
+  <canvas id="workCanvas" hidden></canvas>
+  <canvas id="maskCanvas" hidden></canvas>
+
+  <script async src="https://docs.opencv.org/4.x/opencv.js"></script>
+
+  <script type="module">
+    import {
+      FilesetResolver,
+      HandLandmarker
+    } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.35/+esm";
+
+    const video = document.getElementById("video");
+    const overlayCanvas = document.getElementById("overlayCanvas");
+    const overlayCtx = overlayCanvas.getContext("2d", { willReadFrequently: true });
+
+    const frameCanvas = document.getElementById("frameCanvas");
+    const frameCtx = frameCanvas.getContext("2d", { willReadFrequently: true });
+
+    const workCanvas = document.getElementById("workCanvas");
+    const workCtx = workCanvas.getContext("2d", { willReadFrequently: true });
+
+    const maskCanvas = document.getElementById("maskCanvas");
+    const maskCtx = maskCanvas.getContext("2d", { willReadFrequently: true });
+
+    const startButton = document.getElementById("startButton");
+    const statusEl = document.getElementById("status");
+
+    const scaleInput = document.getElementById("scaleInput");
+    const scaleValue = document.getElementById("scaleValue");
+    const paddingInput = document.getElementById("paddingInput");
+    const paddingValue = document.getElementById("paddingValue");
+    const iterationsInput = document.getElementById("iterationsInput");
+    const iterationsValue = document.getElementById("iterationsValue");
+    const showLandmarksInput = document.getElementById("showLandmarksInput");
+
+    scaleInput.addEventListener("input", () => scaleValue.textContent = Number(scaleInput.value).toFixed(2));
+    paddingInput.addEventListener("input", () => paddingValue.textContent = paddingInput.value);
+    iterationsInput.addEventListener("input", () => iterationsValue.textContent = iterationsInput.value);
+
+    let handLandmarker;
+    let running = false;
+    let opencvReady = false;
+    let mediapipeReady = false;
+    let lastVideoTime = -1;
+
+    const OUTER_HAND_CONNECTIONS = [
+      [0, 1], [1, 2], [2, 3], [3, 4],       // thumb
+      [4, 8],                               // bridge thumb tip to index tip
+      [8, 12], [12, 16], [16, 20],          // fingertip ridge
+      [20, 19], [19, 18], [18, 17],         // pinky outer edge
+      [17, 0]                               // back to wrist
+    ];
+
+    // Ordered points used to draw a rough hand polygon.
+    // This is intentionally loose: GrabCut should refine the boundary.
+    const ROUGH_OUTLINE_INDICES = [
+      0, 1, 2, 3, 4, 8, 12, 16, 20, 19, 18, 17
+    ];
+
+    cvReady().then(() => {
+      opencvReady = true;
+      maybeEnableStart();
+    });
+
+    initMediaPipe().then(() => {
+      mediapipeReady = true;
+      maybeEnableStart();
+    });
+
+    startButton.addEventListener("click", async () => {
+      startButton.disabled = true;
+      statusEl.textContent = "Starting camera…";
+      await startCamera();
+      running = true;
+      statusEl.textContent = "Running";
+      requestAnimationFrame(loop);
+    });
+
+    function maybeEnableStart() {
+      if (!opencvReady || !mediapipeReady) return;
+      startButton.textContent = "Start webcam";
+      startButton.disabled = false;
+      statusEl.textContent = "Ready";
+    }
+
+    function cvReady() {
+      return new Promise(resolve => {
+        const check = () => {
+          if (window.cv && cv.Mat) {
+            if (cv.onRuntimeInitialized) {
+              const old = cv.onRuntimeInitialized;
+              cv.onRuntimeInitialized = () => {
+                old?.();
+                resolve();
+              };
+            } else {
+              resolve();
+            }
+          } else {
+            setTimeout(check, 50);
+          }
+        };
+        check();
+      });
+    }
+
+    async function initMediaPipe() {
+      statusEl.textContent = "Loading MediaPipe…";
+      const vision = await FilesetResolver.forVisionTasks(
+        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.35/wasm"
+      );
+
+      handLandmarker = await HandLandmarker.createFromOptions(vision, {
+        baseOptions: {
+          modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task",
+          delegate: "GPU"
+        },
+        runningMode: "VIDEO",
+        numHands: 1,
+        minHandDetectionConfidence: 0.55,
+        minHandPresenceConfidence: 0.55,
+        minTrackingConfidence: 0.55
+      });
+    }
+
+    async function startCamera() {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          facingMode: "user",
+          width: { ideal: 1280 },
+          height: { ideal: 720 }
+        },
+        audio: false
+      });
+      video.srcObject = stream;
+      await video.play();
+
+      resizeCanvases(video.videoWidth, video.videoHeight);
+    }
+
+    function resizeCanvases(width, height) {
+      for (const canvas of [overlayCanvas, frameCanvas]) {
+        canvas.width = width;
+        canvas.height = height;
+      }
+    }
+
+    function loop(now) {
+      if (!running) return;
+
+      if (video.currentTime !== lastVideoTime && video.videoWidth > 0) {
+        lastVideoTime = video.currentTime;
+        processFrame(now);
+      }
+
+      requestAnimationFrame(loop);
+    }
+
+    function processFrame(now) {
+      const width = video.videoWidth;
+      const height = video.videoHeight;
+
+      frameCtx.drawImage(video, 0, 0, width, height);
+      overlayCtx.clearRect(0, 0, width, height);
+
+      const result = handLandmarker.detectForVideo(video, now);
+      const landmarks = result.landmarks?.[0];
+
+      if (!landmarks) {
+        statusEl.textContent = "No hand detected";
+        return;
+      }
+
+      try {
+        const maskImageData = refineHandMaskWithGrabCut(landmarks, width, height);
+        drawRedOverlay(maskImageData, width, height);
+        if (showLandmarksInput.checked) drawLandmarks(landmarks, width, height);
+        statusEl.textContent = "Running";
+      } catch (error) {
+        console.error(error);
+        statusEl.textContent = "GrabCut error — try lower scale";
+      }
+    }
+
+    function refineHandMaskWithGrabCut(landmarks, videoWidth, videoHeight) {
+      const scale = Number(scaleInput.value);
+      const padding = Number(paddingInput.value);
+      const iterations = Number(iterationsInput.value);
+
+      const workWidth = Math.round(videoWidth * scale);
+      const workHeight = Math.round(videoHeight * scale);
+
+      workCanvas.width = workWidth;
+      workCanvas.height = workHeight;
+      maskCanvas.width = workWidth;
+      maskCanvas.height = workHeight;
+
+      workCtx.drawImage(frameCanvas, 0, 0, workWidth, workHeight);
+
+      const pts = landmarks.map(p => ({
+        x: p.x * workWidth,
+        y: p.y * workHeight
+      }));
+
+      const bounds = getBounds(pts, padding * scale, workWidth, workHeight);
+
+      // Build a mask using OpenCV's GrabCut class values:
+      // GC_BGD = sure background, GC_FGD = sure foreground,
+      // GC_PR_BGD = probable background, GC_PR_FGD = probable foreground.
+      const mask = new cv.Mat(workHeight, workWidth, cv.CV_8UC1, new cv.Scalar(cv.GC_BGD));
+
+      // Start with probable background inside the padded hand bounding box.
+      const rect = new cv.Rect(bounds.x, bounds.y, bounds.width, bounds.height);
+      const roi = mask.roi(rect);
+      roi.setTo(new cv.Scalar(cv.GC_PR_BGD));
+      roi.delete();
+
+      // Draw a loose probable-foreground polygon from the outer landmarks.
+      drawRoughHandMask(pts, workWidth, workHeight, "white");
+      const rough = cv.imread(maskCanvas);
+      const roughGray = new cv.Mat();
+      cv.cvtColor(rough, roughGray, cv.COLOR_RGBA2GRAY);
+
+      // Dilate the landmark polygon to include nearby boundary pixels.
+      const probableFg = new cv.Mat();
+      const kernelSize = Math.max(9, Math.round(24 * scale) | 1);
+      const kernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(kernelSize, kernelSize));
+      cv.dilate(roughGray, probableFg, kernel);
+
+      // Erode the landmark polygon to create a conservative sure-foreground core.
+      const sureFg = new cv.Mat();
+      const erodeSize = Math.max(3, Math.round(8 * scale) | 1);
+      const erodeKernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(erodeSize, erodeSize));
+      cv.erode(roughGray, sureFg, erodeKernel);
+
+      // Assign probable foreground where dilated polygon exists.
+      setGrabCutClassFromBinary(mask, probableFg, cv.GC_PR_FGD);
+      // Assign sure foreground where eroded polygon exists.
+      setGrabCutClassFromBinary(mask, sureFg, cv.GC_FGD);
+
+      const src = cv.imread(workCanvas);
+      const srcBgr = new cv.Mat();
+      cv.cvtColor(src, srcBgr, cv.COLOR_RGBA2RGB);
+
+      const bgdModel = new cv.Mat();
+      const fgdModel = new cv.Mat();
+
+      cv.grabCut(srcBgr, mask, rect, bgdModel, fgdModel, iterations, cv.GC_INIT_WITH_MASK);
+
+      // Convert GrabCut labels to a binary alpha mask.
+      const outputMask = grabCutMaskToBinary(mask);
+
+      // Clean small holes/noise.
+      const cleanKernel = cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(5, 5));
+      cv.morphologyEx(outputMask, outputMask, cv.MORPH_CLOSE, cleanKernel);
+      cv.morphologyEx(outputMask, outputMask, cv.MORPH_OPEN, cleanKernel);
+
+      const fullSizeMask = new cv.Mat();
+      cv.resize(outputMask, fullSizeMask, new cv.Size(videoWidth, videoHeight), 0, 0, cv.INTER_LINEAR);
+
+      const rgba = binaryMaskToRedOverlayImageData(fullSizeMask, videoWidth, videoHeight);
+
+      mask.delete();
+      rough.delete();
+      roughGray.delete();
+      probableFg.delete();
+      sureFg.delete();
+      kernel.delete();
+      erodeKernel.delete();
+      src.delete();
+      srcBgr.delete();
+      bgdModel.delete();
+      fgdModel.delete();
+      outputMask.delete();
+      cleanKernel.delete();
+      fullSizeMask.delete();
+
+      return rgba;
+    }
+
+    function drawRoughHandMask(points, width, height, fillStyle) {
+      maskCtx.clearRect(0, 0, width, height);
+      maskCtx.fillStyle = "black";
+      maskCtx.fillRect(0, 0, width, height);
+      maskCtx.fillStyle = fillStyle;
+      maskCtx.beginPath();
+
+      const first = points[ROUGH_OUTLINE_INDICES[0]];
+      maskCtx.moveTo(first.x, first.y);
+
+      for (let i = 1; i < ROUGH_OUTLINE_INDICES.length; i++) {
+        const p = points[ROUGH_OUTLINE_INDICES[i]];
+        maskCtx.lineTo(p.x, p.y);
+      }
+
+      maskCtx.closePath();
+      maskCtx.fill();
+
+      // Add thicker strokes along the palm/fingers to avoid a too-thin seed.
+      maskCtx.lineCap = "round";
+      maskCtx.lineJoin = "round";
+      maskCtx.strokeStyle = fillStyle;
+      maskCtx.lineWidth = Math.max(12, width * 0.025);
+      maskCtx.stroke();
+    }
+
+    function getBounds(points, padding, width, height) {
+      let minX = Infinity;
+      let minY = Infinity;
+      let maxX = -Infinity;
+      let maxY = -Infinity;
+
+      for (const p of points) {
+        minX = Math.min(minX, p.x);
+        minY = Math.min(minY, p.y);
+        maxX = Math.max(maxX, p.x);
+        maxY = Math.max(maxY, p.y);
+      }
+
+      const x = clamp(Math.floor(minX - padding), 0, width - 1);
+      const y = clamp(Math.floor(minY - padding), 0, height - 1);
+      const right = clamp(Math.ceil(maxX + padding), 1, width);
+      const bottom = clamp(Math.ceil(maxY + padding), 1, height);
+
+      return {
+        x,
+        y,
+        width: Math.max(1, right - x),
+        height: Math.max(1, bottom - y)
+      };
+    }
+
+    function setGrabCutClassFromBinary(grabCutMask, binaryMask, grabCutClass) {
+      for (let y = 0; y < binaryMask.rows; y++) {
+        for (let x = 0; x < binaryMask.cols; x++) {
+          if (binaryMask.ucharPtr(y, x)[0] > 0) {
+            grabCutMask.ucharPtr(y, x)[0] = grabCutClass;
+          }
+        }
+      }
+    }
+
+    function grabCutMaskToBinary(mask) {
+      const binary = new cv.Mat(mask.rows, mask.cols, cv.CV_8UC1, new cv.Scalar(0));
+
+      for (let y = 0; y < mask.rows; y++) {
+        for (let x = 0; x < mask.cols; x++) {
+          const value = mask.ucharPtr(y, x)[0];
+          const isForeground = value === cv.GC_FGD || value === cv.GC_PR_FGD;
+          binary.ucharPtr(y, x)[0] = isForeground ? 255 : 0;
+        }
+      }
+
+      return binary;
+    }
+
+    function binaryMaskToRedOverlayImageData(binaryMask, width, height) {
+      const imageData = overlayCtx.createImageData(width, height);
+      const data = imageData.data;
+
+      for (let y = 0; y < height; y++) {
+        for (let x = 0; x < width; x++) {
+          const i = (y * width + x) * 4;
+          const alpha = binaryMask.ucharPtr(y, x)[0];
+          data[i + 0] = 255;
+          data[i + 1] = 0;
+          data[i + 2] = 0;
+          data[i + 3] = alpha > 20 ? 110 : 0;
+        }
+      }
+
+      return imageData;
+    }
+
+    function drawRedOverlay(maskImageData, width, height) {
+      overlayCtx.putImageData(maskImageData, 0, 0);
+    }
+
+    function drawLandmarks(landmarks, width, height) {
+      overlayCtx.save();
+      overlayCtx.lineWidth = 3;
+      overlayCtx.strokeStyle = "rgba(255,255,255,0.9)";
+      overlayCtx.fillStyle = "rgba(255,255,255,0.95)";
+
+      for (const [a, b] of OUTER_HAND_CONNECTIONS) {
+        const p1 = landmarks[a];
+        const p2 = landmarks[b];
+        overlayCtx.beginPath();
+        overlayCtx.moveTo(p1.x * width, p1.y * height);
+        overlayCtx.lineTo(p2.x * width, p2.y * height);
+        overlayCtx.stroke();
+      }
+
+      for (const p of landmarks) {
+        overlayCtx.beginPath();
+        overlayCtx.arc(p.x * width, p.y * height, 4, 0, Math.PI * 2);
+        overlayCtx.fill();
+      }
+      overlayCtx.restore();
+    }
+
+    function clamp(value, min, max) {
+      return Math.min(max, Math.max(min, value));
+    }
+  </script>
+</body>
+</html>
