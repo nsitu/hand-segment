@@ -225,6 +225,10 @@
         handZone: new cv.Mat(height, width, cv.CV_8UC1),
         sat: new cv.Mat(height, width, cv.CV_8UC1),
         val: new cv.Mat(height, width, cv.CV_8UC1),
+        satLow: new cv.Mat(height, width, cv.CV_8UC1),
+        satHigh: new cv.Mat(height, width, cv.CV_8UC1),
+        valLow: new cv.Mat(height, width, cv.CV_8UC1),
+        valHigh: new cv.Mat(height, width, cv.CV_8UC1),
         satMask: new cv.Mat(height, width, cv.CV_8UC1),
         valMask: new cv.Mat(height, width, cv.CV_8UC1),
         colourMask: new cv.Mat(height, width, cv.CV_8UC1),
@@ -353,11 +357,21 @@
       const lowB = Math.max(0, Math.floor(ranges.bLow - padB));
       const highB = Math.min(255, Math.ceil(ranges.bHigh + padB));
 
-      cv.extractChannel(lab, mats.sat, 1); // LAB a-channel, analogous to the Python script's channel 1.
-      cv.extractChannel(lab, mats.val, 2); // LAB b-channel, analogous to the Python script's channel 2.
+      cv.split(lab, mats.channels);
+      const aChannel = mats.channels.get(1);
+      const bChannel = mats.channels.get(2);
+      aChannel.copyTo(mats.sat); // LAB a-channel, analogous to the Python script's channel 1.
+      bChannel.copyTo(mats.val); // LAB b-channel, analogous to the Python script's channel 2.
+      aChannel.delete();
+      bChannel.delete();
 
-      cv.inRange(mats.sat, new cv.Mat(mats.sat.rows, mats.sat.cols, mats.sat.type(), [lowA]), new cv.Mat(mats.sat.rows, mats.sat.cols, mats.sat.type(), [highA]), mats.satMask);
-      cv.inRange(mats.val, new cv.Mat(mats.val.rows, mats.val.cols, mats.val.type(), [lowB]), new cv.Mat(mats.val.rows, mats.val.cols, mats.val.type(), [highB]), mats.valMask);
+      mats.satLow.setTo(new cv.Scalar(lowA));
+      mats.satHigh.setTo(new cv.Scalar(highA));
+      mats.valLow.setTo(new cv.Scalar(lowB));
+      mats.valHigh.setTo(new cv.Scalar(highB));
+
+      cv.inRange(mats.sat, mats.satLow, mats.satHigh, mats.satMask);
+      cv.inRange(mats.val, mats.valLow, mats.valHigh, mats.valMask);
       cv.bitwise_and(mats.satMask, mats.valMask, mats.colourMask);
       cv.bitwise_or(mats.colourMask, mats.skeletonBinary, mats.colourMask);
     }
