@@ -28,9 +28,10 @@
     }
 
     .stage {
+      --stage-aspect-ratio: 16 / 9;
       position: relative;
       width: 100%;
-      aspect-ratio: 16 / 9;
+      aspect-ratio: var(--stage-aspect-ratio);
       border-radius: 18px;
       overflow: hidden;
       background: #000;
@@ -142,6 +143,7 @@
  
     const video = document.getElementById("video");
     const output = document.getElementById("output");
+  const stage = document.querySelector(".stage");
     const ctx = output.getContext("2d", { willReadFrequently: true });
     const startButton = document.getElementById("startButton");
     const statusEl = document.getElementById("status");
@@ -256,6 +258,8 @@
       const height = video.videoHeight;
       if (!width || !height) return false;
 
+      updateStageAspectRatio(width, height);
+
       if (output.width !== width || output.height !== height) {
         output.width = width;
         output.height = height;
@@ -265,6 +269,27 @@
       }
 
       return true;
+    }
+
+    function updateStageAspectRatio(width, height) {
+      if (!stage || !width || !height) return;
+      stage.style.setProperty("--stage-aspect-ratio", `${width} / ${height}`);
+    }
+
+    function isLikelyMobileDevice() {
+      return window.matchMedia("(pointer: coarse)").matches || /Android|iPhone|iPad|iPod/i.test(navigator.userAgent);
+    }
+
+    function buildVideoConstraints() {
+      const prefersPortrait = window.matchMedia("(orientation: portrait)").matches;
+      const useMobileProfile = isLikelyMobileDevice();
+
+      return {
+        facingMode: { ideal: "user" },
+        width: { ideal: useMobileProfile && prefersPortrait ? 720 : 1280 },
+        height: { ideal: useMobileProfile && prefersPortrait ? 1280 : 720 },
+        aspectRatio: { ideal: useMobileProfile && prefersPortrait ? 9 / 16 : 16 / 9 }
+      };
     }
 
     function drawLandmarkSkeleton(landmarks, width, height) {
@@ -472,11 +497,7 @@
       setStatus("Requesting camera…");
 
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: {
-          facingMode: "user",
-          width: { ideal: 960 },
-          height: { ideal: 540 }
-        },
+        video: buildVideoConstraints(),
         audio: false
       });
 
