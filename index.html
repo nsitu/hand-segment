@@ -230,15 +230,19 @@
       0, 1, 2, 3, 4, 8, 12, 16, 20, 19, 18, 17
     ];
 
-    cvReady().then(() => {
-      opencvReady = true;
-      maybeEnableStart();
-    });
+    cvReady()
+      .then(() => {
+        opencvReady = true;
+        maybeEnableStart();
+      })
+      .catch(error => handleInitFailure("OpenCV failed to load", error));
 
-    initMediaPipe().then(() => {
-      mediapipeReady = true;
-      maybeEnableStart();
-    });
+    initMediaPipe()
+      .then(() => {
+        mediapipeReady = true;
+        maybeEnableStart();
+      })
+      .catch(error => handleInitFailure("MediaPipe failed to load", error));
 
     startButton.addEventListener("click", async () => {
       startButton.disabled = true;
@@ -256,23 +260,39 @@
       statusEl.textContent = "Ready";
     }
 
+    function handleInitFailure(message, error) {
+      console.error(error);
+      startButton.textContent = "Load failed";
+      startButton.disabled = true;
+      statusEl.textContent = message;
+    }
+
     function cvReady() {
-      return new Promise(resolve => {
+      return new Promise((resolve, reject) => {
         const check = () => {
-          if (window.cv && cv.Mat) {
-            if (cv.onRuntimeInitialized) {
-              const old = cv.onRuntimeInitialized;
-              cv.onRuntimeInitialized = () => {
-                old?.();
-                resolve();
-              };
-            } else {
+          if (window.cv) {
+            if (cv.Mat) {
               resolve();
+              return;
             }
-          } else {
-            setTimeout(check, 50);
+
+            const old = cv.onRuntimeInitialized;
+            cv.onRuntimeInitialized = () => {
+              old?.();
+              resolve();
+            };
+            return;
           }
+
+          setTimeout(check, 50);
         };
+
+        window.addEventListener("error", event => {
+          if (String(event.filename || "").includes("opencv.js")) {
+            reject(new Error("Failed to load OpenCV runtime"));
+          }
+        }, { once: true });
+
         check();
       });
     }
