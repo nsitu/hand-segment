@@ -1,0 +1,501 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Hand Segmentation: MediaPipe Landmarks + LAB Colour Model</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #111;
+      color: #f4f4f4;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      padding: 1rem;
+      box-sizing: border-box;
+    }
+
+    main {
+      width: min(960px, 100%);
+      display: grid;
+      gap: 1rem;
+    }
+
+    .stage {
+      position: relative;
+      width: 100%;
+      aspect-ratio: 16 / 9;
+      border-radius: 18px;
+      overflow: hidden;
+      background: #000;
+      box-shadow: 0 20px 60px rgb(0 0 0 / 0.45);
+    }
+
+    video,
+    canvas {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      transform: scaleX(-1);
+    }
+
+    video {
+      opacity: 0;
+      pointer-events: none;
+    }
+
+    .controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.75rem;
+      align-items: center;
+      justify-content: space-between;
+      background: #1c1c1c;
+      border: 1px solid #333;
+      border-radius: 14px;
+      padding: 0.85rem 1rem;
+    }
+
+    button {
+      appearance: none;
+      border: 0;
+      border-radius: 999px;
+      padding: 0.7rem 1rem;
+      font: inherit;
+      font-weight: 700;
+      cursor: pointer;
+      background: #f4f4f4;
+      color: #111;
+    }
+
+    button:disabled {
+      opacity: 0.5;
+      cursor: wait;
+    }
+
+    label {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.45rem;
+      font-size: 0.9rem;
+      color: #ddd;
+    }
+
+    input[type="range"] {
+      width: 140px;
+    }
+
+    .status {
+      font-size: 0.9rem;
+      color: #bbb;
+    }
+
+    .hint {
+      color: #bbb;
+      line-height: 1.45;
+      margin: 0;
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <section class="stage">
+      <video id="video" autoplay playsinline muted></video>
+      <canvas id="output"></canvas>
+    </section>
+
+    <section class="controls">
+      <button id="startButton">Start camera</button>
+      <label>
+        Mask alpha
+        <input id="alphaSlider" type="range" min="0" max="1" step="0.05" value="0.45" />
+      </label>
+      <label>
+        Colour tolerance
+        <input id="toleranceSlider" type="range" min="0.01" max="0.2" step="0.005" value="0.035" />
+      </label>
+      <span id="status" class="status">Loading libraries…</span>
+    </section>
+
+    <p class="hint">
+      Place one open hand in front of the front-facing camera. This demo draws a thick MediaPipe landmark skeleton, samples LAB colour from that skeleton, thresholds nearby pixels, then cleans the result with morphological operations.
+    </p>
+  </main>
+
+  <script async src="https://docs.opencv.org/4.x/opencv.js"></script>
+
+  <script type="module">
+    import {
+      FilesetResolver,
+      HandLandmarker
+    } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.22-rc.20250304/vision_bundle.mjs";
+
+    const video = document.getElementById("video");
+    const output = document.getElementById("output");
+    const ctx = output.getContext("2d", { willReadFrequently: true });
+    const startButton = document.getElementById("startButton");
+    const statusEl = document.getElementById("status");
+    const alphaSlider = document.getElementById("alphaSlider");
+    const toleranceSlider = document.getElementById("toleranceSlider");
+
+    const HAND_CONNECTIONS = [
+      [0, 1], [1, 5], [5, 2], [5, 17], [0, 17],
+      [1, 2], [2, 3], [3, 4], [1, 17], [0, 5],
+      [5, 6], [6, 7], [7, 8],
+      [9, 10], [10, 11], [11, 12],
+      [13, 14], [14, 15], [15, 16],
+      [17, 18], [18, 19], [19, 20]
+    ];
+
+    const PALM_POLYGON = [0, 1, 5, 17];
+
+    const skeletonCanvas = document.createElement("canvas");
+    const skeletonCtx = skeletonCanvas.getContext("2d", { willReadFrequently: true });
+
+    let handLandmarker = null;
+    let cvReady = false;
+    let mediaPipeReady = false;
+    let running = false;
+    let mats = null;
+
+    function setStatus(message) {
+      statusEl.textContent = message;
+    }
+
+    function maybeEnableStart() {
+      if (cvReady && mediaPipeReady) {
+        startButton.disabled = false;
+        setStatus("Ready");
+      }
+    }
+
+    function waitForOpenCv() {
+      return new Promise((resolve) => {
+        const check = () => {
+          if (window.cv && cv.Mat) {
+            if (cv.getBuildInformation) resolve();
+            else cv.onRuntimeInitialized = resolve;
+          } else {
+            requestAnimationFrame(check);
+          }
+        };
+        check();
+      });
+    }
+
+    async function loadMediaPipe() {
+      const vision = await FilesetResolver.forVisionTasks(
+        "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.22-rc.20250304/wasm"
+      );
+
+      handLandmarker = await HandLandmarker.createFromOptions(vision, {
+        baseOptions: {
+          modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+          delegate: "GPU"
+        },
+        runningMode: "VIDEO",
+        numHands: 1,
+        minHandDetectionConfidence: 0.6,
+        minHandPresenceConfidence: 0.6,
+        minTrackingConfidence: 0.6
+      });
+    }
+
+    function allocateMats(width, height) {
+      disposeMats();
+      mats = {
+        frame: new cv.Mat(height, width, cv.CV_8UC4),
+        rgb: new cv.Mat(height, width, cv.CV_8UC3),
+        lab: new cv.Mat(height, width, cv.CV_8UC3),
+        skeletonRGBA: new cv.Mat(height, width, cv.CV_8UC4),
+        skeletonGray: new cv.Mat(height, width, cv.CV_8UC1),
+        skeletonBinary: new cv.Mat(height, width, cv.CV_8UC1),
+        handZone: new cv.Mat(height, width, cv.CV_8UC1),
+        sat: new cv.Mat(height, width, cv.CV_8UC1),
+        val: new cv.Mat(height, width, cv.CV_8UC1),
+        satMask: new cv.Mat(height, width, cv.CV_8UC1),
+        valMask: new cv.Mat(height, width, cv.CV_8UC1),
+        colourMask: new cv.Mat(height, width, cv.CV_8UC1),
+        cleanedMask: new cv.Mat(height, width, cv.CV_8UC1),
+        overlayRGBA: new cv.Mat(height, width, cv.CV_8UC4),
+        alphaMask: new cv.Mat(height, width, cv.CV_8UC1),
+        channels: new cv.MatVector(),
+        kernelSkeleton: cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(3, 3)),
+        kernelZone: cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(21, 21)),
+        kernelClose: cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(13, 13)),
+        kernelFinalDilate: cv.getStructuringElement(cv.MORPH_RECT, new cv.Size(7, 7))
+      };
+    }
+
+    function disposeMats() {
+      if (!mats) return;
+      Object.values(mats).forEach((value) => {
+        if (value && typeof value.delete === "function") value.delete();
+      });
+      mats = null;
+    }
+
+    function resizeCanvases() {
+      const width = video.videoWidth;
+      const height = video.videoHeight;
+      if (!width || !height) return false;
+
+      if (output.width !== width || output.height !== height) {
+        output.width = width;
+        output.height = height;
+        skeletonCanvas.width = width;
+        skeletonCanvas.height = height;
+        allocateMats(width, height);
+      }
+
+      return true;
+    }
+
+    function drawLandmarkSkeleton(landmarks, width, height) {
+      skeletonCtx.clearRect(0, 0, width, height);
+      skeletonCtx.save();
+      skeletonCtx.lineCap = "round";
+      skeletonCtx.lineJoin = "round";
+      skeletonCtx.strokeStyle = "white";
+      skeletonCtx.fillStyle = "white";
+      skeletonCtx.lineWidth = Math.max(7, Math.round(width * 0.014));
+
+      for (const [a, b] of HAND_CONNECTIONS) {
+        const p1 = landmarks[a];
+        const p2 = landmarks[b];
+        skeletonCtx.beginPath();
+        skeletonCtx.moveTo(p1.x * width, p1.y * height);
+        skeletonCtx.lineTo(p2.x * width, p2.y * height);
+        skeletonCtx.stroke();
+      }
+
+      skeletonCtx.beginPath();
+      PALM_POLYGON.forEach((index, i) => {
+        const p = landmarks[index];
+        const x = p.x * width;
+        const y = p.y * height;
+        if (i === 0) skeletonCtx.moveTo(x, y);
+        else skeletonCtx.lineTo(x, y);
+      });
+      skeletonCtx.closePath();
+      skeletonCtx.fill();
+
+      for (const p of landmarks) {
+        skeletonCtx.beginPath();
+        skeletonCtx.arc(p.x * width, p.y * height, Math.max(4, width * 0.008), 0, Math.PI * 2);
+        skeletonCtx.fill();
+      }
+
+      skeletonCtx.restore();
+    }
+
+    function percentile(sortedValues, p) {
+      if (!sortedValues.length) return 0;
+      const index = (sortedValues.length - 1) * p;
+      const lower = Math.floor(index);
+      const upper = Math.ceil(index);
+      if (lower === upper) return sortedValues[lower];
+      const weight = index - lower;
+      return sortedValues[lower] * (1 - weight) + sortedValues[upper] * weight;
+    }
+
+    function sampleLabABFromSkeleton(lab, skeletonBinary, maxSamples = 220) {
+      const width = lab.cols;
+      const height = lab.rows;
+      const labData = lab.data;
+      const maskData = skeletonBinary.data;
+      const aSamples = [];
+      const bSamples = [];
+
+      // Deterministic stride sampling avoids allocating a giant coordinate list.
+      const total = width * height;
+      const stride = Math.max(1, Math.floor(total / (maxSamples * 35)));
+
+      for (let i = 0; i < total; i += stride) {
+        if (maskData[i] !== 255) continue;
+        const base = i * 3;
+        aSamples.push(labData[base + 1]);
+        bSamples.push(labData[base + 2]);
+        if (aSamples.length >= maxSamples) break;
+      }
+
+      if (aSamples.length < 8) return null;
+
+      aSamples.sort((a, b) => a - b);
+      bSamples.sort((a, b) => a - b);
+
+      return {
+        aLow: percentile(aSamples, 0.25),
+        aHigh: percentile(aSamples, 0.75),
+        bLow: percentile(bSamples, 0.25),
+        bHigh: percentile(bSamples, 0.75)
+      };
+    }
+
+    function thresholdLabAB(lab, ranges, toleranceFactor) {
+      const padA = Math.max(4, 255 * toleranceFactor);
+      const padB = Math.max(4, 255 * toleranceFactor);
+
+      const lowA = Math.max(0, Math.floor(ranges.aLow - padA));
+      const highA = Math.min(255, Math.ceil(ranges.aHigh + padA));
+      const lowB = Math.max(0, Math.floor(ranges.bLow - padB));
+      const highB = Math.min(255, Math.ceil(ranges.bHigh + padB));
+
+      cv.extractChannel(lab, mats.sat, 1); // LAB a-channel, analogous to the Python script's channel 1.
+      cv.extractChannel(lab, mats.val, 2); // LAB b-channel, analogous to the Python script's channel 2.
+
+      cv.inRange(mats.sat, new cv.Mat(mats.sat.rows, mats.sat.cols, mats.sat.type(), [lowA]), new cv.Mat(mats.sat.rows, mats.sat.cols, mats.sat.type(), [highA]), mats.satMask);
+      cv.inRange(mats.val, new cv.Mat(mats.val.rows, mats.val.cols, mats.val.type(), [lowB]), new cv.Mat(mats.val.rows, mats.val.cols, mats.val.type(), [highB]), mats.valMask);
+      cv.bitwise_and(mats.satMask, mats.valMask, mats.colourMask);
+      cv.bitwise_or(mats.colourMask, mats.skeletonBinary, mats.colourMask);
+    }
+
+    function segmentCurrentFrame(landmarks) {
+      const width = output.width;
+      const height = output.height;
+
+      drawLandmarkSkeleton(landmarks, width, height);
+
+      const frameImageData = ctx.getImageData(0, 0, width, height);
+      mats.frame.data.set(frameImageData.data);
+      cv.cvtColor(mats.frame, mats.rgb, cv.COLOR_RGBA2RGB);
+      cv.cvtColor(mats.rgb, mats.lab, cv.COLOR_RGB2Lab);
+
+      const skeletonImageData = skeletonCtx.getImageData(0, 0, width, height);
+      mats.skeletonRGBA.data.set(skeletonImageData.data);
+      cv.cvtColor(mats.skeletonRGBA, mats.skeletonGray, cv.COLOR_RGBA2GRAY);
+      cv.threshold(mats.skeletonGray, mats.skeletonBinary, 1, 255, cv.THRESH_BINARY);
+
+      // Python equivalent:
+      // skeleton_binary = dilate(skeleton_binary, 3x3)
+      // mask_s2 = dilate(skeleton_binary, 21x21, iterations=2)
+      cv.dilate(mats.skeletonBinary, mats.skeletonBinary, mats.kernelSkeleton, new cv.Point(-1, -1), 1);
+      cv.dilate(mats.skeletonBinary, mats.handZone, mats.kernelZone, new cv.Point(-1, -1), 2);
+
+      const ranges = sampleLabABFromSkeleton(mats.lab, mats.skeletonBinary);
+      if (!ranges) return null;
+
+      thresholdLabAB(mats.lab, ranges, Number(toleranceSlider.value));
+
+      // Python equivalent:
+      // mask_hsv = close(mask_hsv, 13x13)
+      // mask_hsv = open(mask_hsv, 13x13)
+      // mask_hsv = dilate(mask_hsv, 7x7)
+      // mask_hsv = mask_hsv & mask_s2
+      cv.morphologyEx(mats.colourMask, mats.cleanedMask, cv.MORPH_CLOSE, mats.kernelClose, new cv.Point(-1, -1), 1);
+      cv.morphologyEx(mats.cleanedMask, mats.cleanedMask, cv.MORPH_OPEN, mats.kernelClose, new cv.Point(-1, -1), 1);
+      cv.dilate(mats.cleanedMask, mats.cleanedMask, mats.kernelFinalDilate, new cv.Point(-1, -1), 1);
+      cv.bitwise_and(mats.cleanedMask, mats.handZone, mats.cleanedMask);
+
+      return mats.cleanedMask;
+    }
+
+    function drawOverlay(mask) {
+      const width = output.width;
+      const height = output.height;
+      const alpha = Math.round(Number(alphaSlider.value) * 255);
+
+      const overlay = ctx.getImageData(0, 0, width, height);
+      const pixels = overlay.data;
+      const maskData = mask.data;
+
+      for (let i = 0; i < maskData.length; i++) {
+        if (maskData[i] !== 255) continue;
+        const base = i * 4;
+        // Semi-transparent red over the video frame.
+        pixels[base + 0] = Math.round(pixels[base + 0] * (1 - alpha / 255) + 255 * (alpha / 255));
+        pixels[base + 1] = Math.round(pixels[base + 1] * (1 - alpha / 255));
+        pixels[base + 2] = Math.round(pixels[base + 2] * (1 - alpha / 255));
+        pixels[base + 3] = 255;
+      }
+
+      ctx.putImageData(overlay, 0, 0);
+    }
+
+    function drawNoMaskFrame() {
+      ctx.drawImage(video, 0, 0, output.width, output.height);
+    }
+
+    async function renderLoop() {
+      if (!running) return;
+      if (!resizeCanvases()) {
+        requestAnimationFrame(renderLoop);
+        return;
+      }
+
+      ctx.drawImage(video, 0, 0, output.width, output.height);
+
+      const now = performance.now();
+      const results = handLandmarker.detectForVideo(video, now);
+      const hand = results.landmarks?.[0];
+
+      if (hand) {
+        const mask = segmentCurrentFrame(hand);
+        if (mask) drawOverlay(mask);
+        setStatus("Tracking hand");
+      } else {
+        drawNoMaskFrame();
+        setStatus("Show one open hand to the camera");
+      }
+
+      requestAnimationFrame(renderLoop);
+    }
+
+    async function startCamera() {
+      startButton.disabled = true;
+      setStatus("Requesting camera…");
+
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          facingMode: "user",
+          width: { ideal: 960 },
+          height: { ideal: 540 }
+        },
+        audio: false
+      });
+
+      video.srcObject = stream;
+      await video.play();
+      resizeCanvases();
+      running = true;
+      setStatus("Running");
+      renderLoop();
+    }
+
+    startButton.disabled = true;
+    startButton.addEventListener("click", () => {
+      startCamera().catch((error) => {
+        console.error(error);
+        setStatus(`Camera error: ${error.message}`);
+        startButton.disabled = false;
+      });
+    });
+
+    waitForOpenCv().then(() => {
+      cvReady = true;
+      maybeEnableStart();
+    });
+
+    loadMediaPipe().then(() => {
+      mediaPipeReady = true;
+      maybeEnableStart();
+    }).catch((error) => {
+      console.error(error);
+      setStatus(`MediaPipe error: ${error.message}`);
+    });
+
+    window.addEventListener("pagehide", () => {
+      running = false;
+      disposeMats();
+    });
+  </script>
+</body>
+</html>
